@@ -1,0 +1,14 @@
+t1
+1 2 3 4 5
+
+t2
+10 20 30 40
+
+t3
+10 20 30 40 50
+
+t4
+7
+
+t5
+(Smoothened version of the input vector with averaging effect)

@@ -5,59 +5,44 @@
 
 // 1D convolution kernel with input tiling
 __global__ void convolution1D_InputTiling(float *input, float *mask, float *output, 
-                                        int inputLength, int maskLength) {
+    int inputLength, int maskLength, int outputTileSize) {
     extern __shared__ float sharedMem[];
-    
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    int tx = threadIdx.x;
     int maskRadius = maskLength / 2;
-    int tile_size = blockDim.x;
     
-    // Load input elements into shared memory with padding for mask radius
-    int halo_left_idx = (blockIdx.x * blockDim.x) - maskRadius;
-    int halo_right_idx = (blockIdx.x + 1) * blockDim.x + maskRadius - 1;
-    int shared_mem_size = tile_size + 2 * maskRadius;
+    // Calculate global input and output positions
+    int outputIdx = blockIdx.x * outputTileSize + tx;
+    int inputIdx = outputIdx - maskRadius;
     
-    // Load the left halo elements
-    if (threadIdx.x < maskRadius) {
-        int input_idx = halo_left_idx + threadIdx.x;
-        if (input_idx >= 0 && input_idx < inputLength) {
-            sharedMem[threadIdx.x] = input[input_idx];
-        } else {
-            sharedMem[threadIdx.x] = 0.0f;  // Zero padding
-        }
-    }
-    
-    // Load the central elements
-    int input_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (input_idx < inputLength) {
-        sharedMem[threadIdx.x + maskRadius] = input[input_idx];
+    // Load input elements into shared memory (with boundary handling)
+    //Each thread loads exactly one input element:
+    if (inputIdx >= 0 && inputIdx < inputLength) {
+        sharedMem[tx] = input[inputIdx];
     } else {
-        sharedMem[threadIdx.x + maskRadius] = 0.0f;  // Zero padding
+        sharedMem[tx] = 0.0f;  
     }
     
-    // Load the right halo elements
-    if (threadIdx.x < maskRadius) {
-        int input_idx = (blockIdx.x + 1) * blockDim.x + threadIdx.x;
-        if (input_idx < inputLength) {
-            sharedMem[threadIdx.x + tile_size + maskRadius] = input[input_idx];
-        } else {
-            sharedMem[threadIdx.x + tile_size + maskRadius] = 0.0f;  // Zero padding
-        }
-    }
-    
-    // Wait for all threads to finish loading data into shared memory
     __syncthreads();
     
-    // Compute convolution using shared memory
-    if (idx < inputLength) {
+    // Only threads with valid output positions compute results
+    // Not all threads calculate output elements:
+    if (tx < outputTileSize && outputIdx < inputLength) {
         float result = 0.0f;
+        
+        // Perform the convolution
         for (int j = 0; j < maskLength; j++) {
-            result += sharedMem[threadIdx.x + j] * mask[j];
+            int sharedIdx = tx + j;
+            // Make sure we don't access out of bounds in shared memory
+            if (sharedIdx < blockDim.x) {
+                result += sharedMem[sharedIdx] * mask[j];
+            }
         }
-        output[idx] = result;
+        
+        // Write result to global memory
+        output[outputIdx] = result;
     }
 }
-
 // Function to read input vector from file
 void readInputFile(const char *filename, float **data, int *length) {
     FILE *file = fopen(filename, "r");
@@ -143,34 +128,26 @@ int main(int argc, char *argv[]) {
     cudaMemcpy(d_input, h_input, inputLength * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_mask, h_mask, maskLength * sizeof(float), cudaMemcpyHostToDevice);
 
-    // Define block and grid sizes
-    int blockSize = 256;
-    int gridSize = (inputLength + blockSize - 1) / blockSize;
-    
-    // Calculate shared memory size for input tiling
-    int sharedMemSize = (blockSize + 2 * (maskLength/2)) * sizeof(float);
 
-    // Measure execution time
-    auto start = std::chrono::high_resolution_clock::now();
+    //int blockSize = outputTileSize + maskLength - 1;
+    int blockSize = 256;
+    int outputTileSize = blockSize - maskLength + 1;
+    int gridSize = (inputLength + outputTileSize - 1) / outputTileSize;
+    
+    // Calculate shared memory size
+    int sharedMemSize = blockSize * sizeof(float);
 
     // Launch convolution kernel with input tiling
     convolution1D_InputTiling<<<gridSize, blockSize, sharedMemSize>>>(d_input, d_mask, d_output, 
-                                                                     inputLength, maskLength);
+                                                                     inputLength, maskLength,outputTileSize);
     
-    // Wait for GPU to finish
-    cudaDeviceSynchronize();
-    
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-
+  
     // Copy result back to host
     float *h_output = (float *)malloc(inputLength * sizeof(float));
     cudaMemcpy(h_output, d_output, inputLength * sizeof(float), cudaMemcpyDeviceToHost);
 
     // Save result to output file
     writeOutputFile(outputFile, h_output, inputLength);
-
-    printf("Kernel execution time: %.6f ms\n", duration / 1000.0);
 
     // Free memory
     cudaFree(d_input);

@@ -3,31 +3,52 @@
 #include <cuda_runtime.h>
 #include <chrono>
 
-// 1D convolution kernel with output tiling
-__global__ void convolution1D_OutputTiling(float *input, float *mask, float *output, 
-                                         int inputLength, int maskLength, int tilesPerThread) {
-    // Each thread will compute multiple output elements
-    int baseIdx = blockIdx.x * blockDim.x + threadIdx.x;
+// Define constant memory for the mask
+__constant__ float c_mask[1024]; // Assuming mask won't be larger than 1024 elements
+
+// 1D convolution kernel with output tiling where block size = tile size
+__global__ void convolution1D_OutputTiling(float *input, float *output, 
+                                         int inputLength, int maskLength, int tileSize) {
     int maskRadius = maskLength / 2;
+    int threadId = threadIdx.x;
+    int tileOffset = blockIdx.x * tileSize;
     
-    // Each thread computes tilesPerThread output elements
-    for (int tile = 0; tile < tilesPerThread; tile++) {
-        int idx = baseIdx * tilesPerThread + tile;
+    // Shared memory for input tile + halo regions
+    extern __shared__ float s_data[];
+    
+    // Each thread helps load the shared memory - both tile and halo elements
+    // We need to load tileSize + maskLength - 1 elements in total
+    // Some threads load more than one input element
+    for (int i = threadId; i < tileSize + maskLength - 1; i += blockDim.x) {
+        int globalIdx = tileOffset + i - maskRadius;
         
-        if (idx < inputLength) {
-            float result = 0.0f;
-            
-            for (int j = 0; j < maskLength; j++) {
-                int inputIdx = idx - maskRadius + j;
-                
-                // Handle boundary conditions - zero padding
-                if (inputIdx >= 0 && inputIdx < inputLength) {
-                    result += input[inputIdx] * mask[j];
-                }
-            }
-            
-            output[idx] = result;
+        // Apply boundary check with zero padding for halo regions
+        if (globalIdx >= 0 && globalIdx < inputLength) {
+            s_data[i] = input[globalIdx];
+        } else {
+            s_data[i] = 0.0f;
         }
+    }
+    
+    // Make sure all threads finished loading shared memory
+    __syncthreads();
+    
+    // Each thread computes one output element within the tile
+    int outputIdx = tileOffset + threadId;
+    
+    if (threadId < tileSize && outputIdx < inputLength) {
+        float result = 0.0f;
+        
+        // The position in shared memory for the current element
+        // threadId is the position in the tile, maskRadius is the halo offset
+        int s_idx = threadId + maskRadius;
+        
+        // Apply the convolution mask
+        for (int j = 0; j < maskLength; j++) {
+            result += s_data[s_idx - maskRadius + j] * c_mask[j];
+        }
+        
+        output[outputIdx] = result;
     }
 }
 
@@ -107,34 +128,31 @@ int main(int argc, char *argv[]) {
     readMaskFile(maskFile, &h_mask, &maskLength);
 
     // Allocate device memory
-    float *d_input, *d_mask, *d_output;
+    float *d_input, *d_output;
     cudaMalloc(&d_input, inputLength * sizeof(float));
-    cudaMalloc(&d_mask, maskLength * sizeof(float));
     cudaMalloc(&d_output, inputLength * sizeof(float));
 
-    // Copy input data and mask to device
+    // Copy input data to device
     cudaMemcpy(d_input, h_input, inputLength * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_mask, h_mask, maskLength * sizeof(float), cudaMemcpyHostToDevice);
+    
+    // Copy mask to constant memory ;since it does not change 
+    // tried to use __restrict but it didnt work so i searched and i find this method
+    cudaMemcpyToSymbol(c_mask, h_mask, maskLength * sizeof(float));
 
     // Define tiling parameters
-    int tilesPerThread = 4;  // Each thread processes 4 output elements
-    int blockSize = 256;
-    int effectiveThreadCount = inputLength / tilesPerThread;
-    int gridSize = (effectiveThreadCount + blockSize - 1) / blockSize;
-
-    // Measure execution time
-    auto start = std::chrono::high_resolution_clock::now();
-
+    int tileSize = 256;  // Size of each output tile (matches the block size)
+    int blockSize = tileSize;  // Block size equals tile size in this design
+    
+    // Calculate grid size (number of tiles needed)
+    int gridSize = (inputLength + tileSize - 1) / tileSize;
+    
+    // Calculate shared memory size - need space for tile + halo regions
+    int sharedMemSize = (tileSize + maskLength - 1) * sizeof(float);
+    
     // Launch convolution kernel with output tiling
-    convolution1D_OutputTiling<<<gridSize, blockSize>>>(d_input, d_mask, d_output, 
-                                                      inputLength, maskLength, tilesPerThread);
+    convolution1D_OutputTiling<<<gridSize, blockSize, sharedMemSize>>>(d_input, d_output, 
+                                                                      inputLength, maskLength, tileSize);
     
-    // Wait for GPU to finish
-    cudaDeviceSynchronize();
-    
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-
     // Copy result back to host
     float *h_output = (float *)malloc(inputLength * sizeof(float));
     cudaMemcpy(h_output, d_output, inputLength * sizeof(float), cudaMemcpyDeviceToHost);
@@ -142,11 +160,8 @@ int main(int argc, char *argv[]) {
     // Save result to output file
     writeOutputFile(outputFile, h_output, inputLength);
 
-    printf("Kernel execution time: %.6f ms\n", duration / 1000.0);
-
     // Free memory
     cudaFree(d_input);
-    cudaFree(d_mask);
     cudaFree(d_output);
     free(h_input);
     free(h_mask);

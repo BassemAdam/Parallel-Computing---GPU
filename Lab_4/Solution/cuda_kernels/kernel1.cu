@@ -13,8 +13,11 @@ __global__ void convolution1D(float *input, float *mask, float *output, int inpu
         
         for (int j = 0; j < maskLength; j++) {
             int inputIdx = idx - maskRadius + j;
-            
-            // Handle boundary conditions - zero padding
+            // How to Handle boundary conditions - zero padding
+            // idx is position in the input then we return by maskRadius then we sum j 
+            // so inputidx might be smaller than zero in that case we just ignore it 
+            // we start considering inputidx if position of element minus maskRadius + J = 0 - 1 + 0 ignore first mask element
+            // 0 - 1 + 1 start multiplying mask with inputidex and sum
             if (inputIdx >= 0 && inputIdx < inputLength) {
                 result += input[inputIdx] * mask[j];
             }
@@ -113,26 +116,15 @@ int main(int argc, char *argv[]) {
     int blockSize = 256;
     int gridSize = (inputLength + blockSize - 1) / blockSize;
 
-    // Measure execution time
-    auto start = std::chrono::high_resolution_clock::now();
-
     // Launch convolution kernel
     convolution1D<<<gridSize, blockSize>>>(d_input, d_mask, d_output, inputLength, maskLength);
     
-    // Wait for GPU to finish
-    cudaDeviceSynchronize();
-    
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-
     // Copy result back to host
     float *h_output = (float *)malloc(inputLength * sizeof(float));
     cudaMemcpy(h_output, d_output, inputLength * sizeof(float), cudaMemcpyDeviceToHost);
 
     // Save result to output file
     writeOutputFile(outputFile, h_output, inputLength);
-
-    printf("Kernel execution time: %.6f ms\n", duration / 1000.0);
 
     // Free memory
     cudaFree(d_input);

@@ -8,11 +8,12 @@ from PIL import Image
 import numpy as np
 from torchvision import transforms
 import matplotlib.pyplot as plt
+from torchvision.transforms import functional as F
 
-class RGBConvolution:
+class RGBToGrayscaleConvolution:
     def __init__(self, mask_file, device='cuda'):
         """
-        Initialize the RGB convolution with a specified mask.
+        Initialize RGB to grayscale convolution with a specified mask.
         
         Args:
             mask_file (str): Path to the mask file
@@ -22,29 +23,30 @@ class RGBConvolution:
         self.mask = self._load_mask(mask_file)
         self.kernel_size = self.mask.shape[0]
         
-        # Create a 2D convolutional layer with the fixed mask weights
+        # Create a 2D convolutional layer that operates on all three channels together
+        # to produce a single grayscale output channel
         self.conv = nn.Conv2d(
-            in_channels=3,  # RGB input
-            out_channels=3,  # RGB output
+            in_channels=3,   # RGB input
+            out_channels=1,  # Grayscale output
             kernel_size=self.kernel_size,
             stride=1,
             padding=self.kernel_size // 2,  # Same padding
-            bias=False,      # No bias term needed
-            groups=3         # Apply the same filter to each channel separately
+            bias=False       # No bias term needed
         )
         
         # Set the weights to our mask values and make them non-learnable
         with torch.no_grad():
-            # Reshape the mask for each input channel (RGB)
+            # Create a 4D tensor [out_channels, in_channels, height, width]
+            # Apply the same mask to each RGB channel
             mask_tensor = torch.tensor(self.mask, dtype=torch.float32)
-            # Create a 4D tensor [out_channels, in_channels/groups, height, width]
-            mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0).repeat(3, 1, 1, 1)
+            mask_tensor = mask_tensor.unsqueeze(0).repeat(3, 1, 1)
+            mask_tensor = mask_tensor.unsqueeze(0)  # [1, 3, kernel_size, kernel_size]
             self.conv.weight = nn.Parameter(mask_tensor, requires_grad=False)
         
         # Move the model to the specified device
         self.conv = self.conv.to(device)
         
-        print(f"Initialized RGB convolution with {self.kernel_size}x{self.kernel_size} mask")
+        print(f"Initialized RGB to Grayscale convolution with {self.kernel_size}x{self.kernel_size} mask")
         print(f"Using device: {device}")
         
     def _load_mask(self, mask_file):
@@ -71,37 +73,51 @@ class RGBConvolution:
     
     def apply_convolution(self, images, stride=1):
         """
-        Apply the convolution to a batch of images.
+        Apply the convolution to a batch of images and normalize results.
         
         Args:
             images (torch.Tensor): Batch of images [B, C, H, W]
             stride (int): Stride value for convolution
             
         Returns:
-            torch.Tensor: Batch of convolved images [B, C, H, W]
+            torch.Tensor: Batch of convolved grayscale images [B, 1, H, W]
         """
-        # If stride is 1, we can use the pre-configured conv layer
+      # If stride is 1, we can use the pre-configured conv layer
         if stride == 1:
             with torch.no_grad():
-                return self.conv(images)
+                output = self.conv(images)
         else:
             # For other strides, create a new temporary convolution
             with torch.no_grad():
                 temp_conv = nn.Conv2d(
                     in_channels=3,
-                    out_channels=3,
+                    out_channels=1,
                     kernel_size=self.kernel_size,
                     stride=stride,
                     padding=self.kernel_size // 2,
-                    bias=False,
-                    groups=3
+                    bias=False
                 ).to(self.device)
                 
                 # Set the weights to our mask values
                 temp_conv.weight = self.conv.weight
                 
                 # Apply convolution
-                return temp_conv(images)
+                output = temp_conv(images)
+
+        # Print a sample of raw output values
+        print(f"\nRaw convolution output (sample):")
+        print(output[0, 0, 10:15, 10:15])  # Print a 5x5 patch from first image
+        print(f"Raw output min: {torch.min(output).item()}, max: {torch.max(output).item()}")
+        
+        max_values = torch.amax(torch.abs(output), dim=(1, 2, 3), keepdim=True)
+        normalized = output / (3.0)
+        normalized = torch.where(normalized < 0, torch.zeros_like(normalized), normalized)
+        # Normalize by the max value (avoid division by zero)
+        max_values = torch.clamp(max_values, min=1e-8)  # Avoid division by zero
+        normalized = output / max_values
+        
+
+        return normalized
 
     def process_images(self, input_folder, output_folder, batch_size=1, stride=1):
         """
@@ -127,7 +143,8 @@ class RGBConvolution:
         
         # Image transformation pipeline
         transform = transforms.Compose([
-            transforms.ToTensor(),  # Convert PIL Image to tensor and scale to [0, 1]
+            transforms.Resize((512, 512)),  # Force resize to exactly 512x512
+            transforms.ToTensor(),          # Convert to tensor [0,1]
         ])
         
         # Process images in batches
@@ -164,14 +181,15 @@ class RGBConvolution:
             
             # Save output images
             for j, img_file in enumerate(batch_files[:len(batch_images)]):
-                output_img = output_tensor[j].cpu().numpy().transpose(1, 2, 0)
+                # Get grayscale output and convert to numpy
+                output_img = output_tensor[j].cpu().squeeze(0).numpy()
                 
                 # Convert to uint8 range [0, 255]
-                output_img = np.clip(output_img * 255, 0, 255).astype(np.uint8)
+                output_img = (output_img * 255).astype(np.uint8)
                 
-                # Save the output image
+                # Save the output image as grayscale
                 output_path = os.path.join(output_folder, img_file)
-                Image.fromarray(output_img).save(output_path)
+                Image.fromarray(output_img, mode='L').save(output_path)
                 
         end_time = time.time()
         total_time = end_time - start_time
@@ -183,7 +201,7 @@ class RGBConvolution:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='PyTorch 3D RGB Image Convolution')
+    parser = argparse.ArgumentParser(description='PyTorch RGB to Grayscale Convolution')
     parser.add_argument('input_folder', help='Path to input image folder')
     parser.add_argument('output_folder', help='Path to output image folder')
     parser.add_argument('batch_size', type=int, help='Batch size for processing')
@@ -205,7 +223,7 @@ def main():
     print(f"  Device: {device}")
     
     # Create convolution processor
-    processor = RGBConvolution(args.mask_file, device=device)
+    processor = RGBToGrayscaleConvolution(args.mask_file, device=device)
     
     # Process images
     processing_time = processor.process_images(

@@ -103,6 +103,7 @@ class RGBToGrayscaleConvolution:
                 
                 # Apply convolution
                 output = temp_conv(images)
+                print(f"Input shape: {images.shape}, Output shape: {output.shape}")
 
         # Print a sample of raw output values
         print(f"\nRaw convolution output (sample):")

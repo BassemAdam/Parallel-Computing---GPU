@@ -28,7 +28,6 @@ typedef struct
 #define TILE_WIDTH 16
 #define TILE_HEIGHT 16
 
-// Input tiling kernel - each block matches the input tile size
 __global__ void convolution3D_BatchedSingleChannel_InputTiling(
     unsigned char **inputs, // Array of pointers to input images
     float **outputs,        // Array of pointers to output images
@@ -37,85 +36,82 @@ __global__ void convolution3D_BatchedSingleChannel_InputTiling(
     int channels,
     int maskSize,
     int stride,
-    int batchSize) // Number of images in the batch
+    int batchSize,
+    int outputTileSize_x,
+    int outputTileSize_y) 
 {
-    // Calculate output position
-    int out_x = blockIdx.x * TILE_WIDTH + threadIdx.x;
-    int out_y = blockIdx.y * TILE_HEIGHT + threadIdx.y;
-    int imageIdx = blockIdx.z; // Each z-block handles one image in the batch
-
-    // Calculate input image position by multiplying by stride
-    int in_x = out_x * stride;
-    int in_y = out_y * stride;
-    // Shared memory for input tiles including halos for all channels
-    extern __shared__ unsigned char sharedInput[];
-
+    extern __shared__ unsigned char sharedMem1[];  // Changed to unsigned char to match input type
+    
     // Calculate the input tile size including halo regions
-    int maskRadius = maskSize / 2;
     int inputTileWidth = TILE_WIDTH * stride + maskSize - 1;
     int inputTileHeight = TILE_HEIGHT * stride + maskSize - 1;
 
-    // Calculate target output size (should match input with proper padding)
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int maskRadius = maskSize / 2;
+    int imageIdx = blockIdx.z; // Each z-block handles one image in the batch
+    
+    // Calculate global output position
+    int outputIdx_x = blockIdx.x * outputTileSize_x + tx;
+    int outputIdx_y = blockIdx.y * outputTileSize_y + ty;
+    
+    // Calculate the corresponding input position (top-left of the filter)
+    int inputIdx_x = blockIdx.x * outputTileSize_x * stride - maskRadius + tx;
+    int inputIdx_y = blockIdx.y * outputTileSize_y * stride - maskRadius + ty;
+
+    // Calculate target output size
     int outWidth = (width - maskSize) / stride + 1;
     int outHeight = (height - maskSize) / stride + 1;
     
-
-    
-  
-
-    // Skip if we're outside the output image bounds or batch size
-    if (out_x >= outWidth || out_y >= outHeight || imageIdx >= batchSize)
-        return;
-
-    // Get pointers for this specific image
+    // Get pointers for this specific image in the batch
     unsigned char *input = inputs[imageIdx];
     float *output = outputs[imageIdx];
 
-    // Load input tile into shared memory with padding
-    for (int c = 0; c < channels; c++)
-    {
-        for (int ty = threadIdx.y; ty < inputTileHeight; ty += blockDim.y)
-        {
-            for (int tx = threadIdx.x; tx < inputTileWidth; tx += blockDim.x)
-            {
-                int ix = blockIdx.x * TILE_WIDTH * stride + tx - maskRadius ;
-                int iy = blockIdx.y * TILE_HEIGHT * stride + ty - maskRadius ;
-
-                if (ix >= 0 && ix < width && iy >= 0 && iy < height)
-                {
-                    sharedInput[(ty * inputTileWidth + tx) * channels + c] = input[(iy * width + ix) * channels + c];
-                }
-                else
-                {
-                    sharedInput[(ty * inputTileWidth + tx) * channels + c] = 0; // Zero padding
-                }
+    // Load input elements into shared memory (with boundary handling)
+    // Using correct indexing for shared memory
+    if (tx < inputTileWidth && ty < inputTileHeight) {
+        int sharedIdx = (ty * inputTileWidth + tx) * channels;
+        int globalX = inputIdx_x;
+        int globalY = inputIdx_y;
+        
+        for (int c = 0; c < channels; c++) {
+            if (globalX >= 0 && globalX < width && globalY >= 0 && globalY < height) {
+                sharedMem1[sharedIdx + c] = input[(globalY * width + globalX) * channels + c];
+            } else {
+                sharedMem1[sharedIdx + c] = 0;  // Zero padding
             }
         }
     }
-
+    
     __syncthreads();
 
-    // Apply convolution mask for this channel
-    float aggregateValue = 0.0f;
-    for (int c = 0; c < channels; c++)
-    {
-        for (int ky = 0; ky < maskSize; ky++)
-        {
-            for (int kx = 0; kx < maskSize; kx++)
-            {
-                int ix = threadIdx.x * stride + kx;
-                int iy = threadIdx.y * stride + ky;
-
-                unsigned char pixel = sharedInput[(iy * inputTileWidth + ix) * channels + c];
-                float maskValue = c_mask[ky * maskSize + kx];
-
-                aggregateValue += static_cast<float>(pixel) * maskValue;
+    // Only threads with valid output positions compute results
+    if (tx < outputTileSize_x && outputIdx_x < outWidth && 
+        ty < outputTileSize_y && outputIdx_y < outHeight) {
+        
+        float result = 0.0f;
+        
+        // Perform the convolution
+        for (int c = 0; c < channels; c++) {
+            for (int ky = 0; ky < maskSize; ky++) {
+                for (int kx = 0; kx < maskSize; kx++) {
+                    // Calculate position in shared memory
+                    int sx = tx * stride + kx;
+                    int sy = ty * stride + ky;
+                    
+                    // Ensure we're within bounds of the shared memory
+                    if (sx < inputTileWidth && sy < inputTileHeight) {
+                        unsigned char pixel = sharedMem1[(sy * inputTileWidth + sx) * channels + c];
+                        float maskValue = c_mask[ky * maskSize + kx];
+                        result += static_cast<float>(pixel) * maskValue;
+                    }
+                }
             }
         }
+        
+        // Write result to global memory
+        output[outputIdx_y * outWidth + outputIdx_x] = result;
     }
-
-    // Write the single-channel result to the output image
-    output[out_y * outWidth + out_x] = aggregateValue;
 }
 
 // Kernel to find minimum and maximum values in the output image
@@ -419,7 +415,8 @@ void processBatch(const std::vector<std::string> &inputFiles,
     convolution3D_BatchedSingleChannel_InputTiling<<<gridSize, blockSize,sharedMemSize>>>(
         d_inputPtrs, d_outputPtrs,
         inputImages[0].width, inputImages[0].height, inputImages[0].channels,
-        maskSize, stride, batchSize);
+        maskSize, stride, batchSize,
+        outputTileSizeWidth, outputTileSizeHeight);
 
     // Check for errors
     cudaError_t err = cudaGetLastError();

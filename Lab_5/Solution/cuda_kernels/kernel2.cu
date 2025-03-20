@@ -69,6 +69,7 @@ __global__ void convolution3D_BatchedSingleChannel_InputTiling(
 
     // Load input elements into shared memory (with boundary handling)
     // Using correct indexing for shared memory
+    //Each thread loads exactly three input element:
     if (tx < inputTileWidth && ty < inputTileHeight) {
         int sharedIdx = (ty * inputTileWidth + tx) * channels;
         int globalX = inputIdx_x;

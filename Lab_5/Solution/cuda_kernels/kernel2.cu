@@ -39,25 +39,29 @@ __global__ void convolution3D_BatchedSingleChannel_InputTiling(
     int stride,
     int batchSize) // Number of images in the batch
 {
-    // Calculate padding needed to maintain input dimensions with stride
-    int padding = ((stride - 1) * (width - 1) + maskSize - 1) / 2;
-    
-    // Calculate target output size (should match input with proper padding)
-    int outWidth = (width + 2 * padding - maskSize) / stride + 1;
-    int outHeight = (height + 2 * padding - maskSize) / stride + 1;
-    
-    // Shared memory for input tiles including halos for all channels
-    extern __shared__ unsigned char sharedInput[];
-    
-    // Calculate the input tile size including halo regions
-    int maskRadius = maskSize / 2;
-    int inputTileWidth = TILE_WIDTH * stride + maskSize - 1;
-    int inputTileHeight = TILE_HEIGHT * stride + maskSize - 1;
-    
     // Calculate output position
     int out_x = blockIdx.x * TILE_WIDTH + threadIdx.x;
     int out_y = blockIdx.y * TILE_HEIGHT + threadIdx.y;
     int imageIdx = blockIdx.z; // Each z-block handles one image in the batch
+
+    // Calculate input image position by multiplying by stride
+    int in_x = out_x * stride;
+    int in_y = out_y * stride;
+    // Shared memory for input tiles including halos for all channels
+    extern __shared__ unsigned char sharedInput[];
+
+    // Calculate the input tile size including halo regions
+    int maskRadius = maskSize / 2;
+    int inputTileWidth = TILE_WIDTH * stride + maskSize - 1;
+    int inputTileHeight = TILE_HEIGHT * stride + maskSize - 1;
+
+    // Calculate target output size (should match input with proper padding)
+    int outWidth = (width - maskSize) / stride + 1;
+    int outHeight = (height - maskSize) / stride + 1;
+    
+
+    
+  
 
     // Skip if we're outside the output image bounds or batch size
     if (out_x >= outWidth || out_y >= outHeight || imageIdx >= batchSize)
@@ -74,8 +78,8 @@ __global__ void convolution3D_BatchedSingleChannel_InputTiling(
         {
             for (int tx = threadIdx.x; tx < inputTileWidth; tx += blockDim.x)
             {
-                int ix = blockIdx.x * TILE_WIDTH * stride + tx - maskRadius - padding;
-                int iy = blockIdx.y * TILE_HEIGHT * stride + ty - maskRadius - padding;
+                int ix = blockIdx.x * TILE_WIDTH * stride + tx - maskRadius ;
+                int iy = blockIdx.y * TILE_HEIGHT * stride + ty - maskRadius ;
 
                 if (ix >= 0 && ix < width && iy >= 0 && iy < height)
                 {
@@ -353,23 +357,15 @@ void processBatch(const std::vector<std::string> &inputFiles,
     std::vector<unsigned char *> d_inputs;
     std::vector<float *> d_outputs;
 
-    int padding = 0; // Padding for the first image (assumed same for all images)
     for (const auto &inputFile : inputFiles)
     {
         RGBImage img = loadImage(inputFile.c_str());
         inputImages.push_back(img);
-
-        // Calculate padding needed to maintain input dimensions with stride
-        padding = ((stride - 1) * (img.width - 1) + maskSize - 1) / 2;
         
         // Calculate output dimensions that match input dimensions with padding
-        int outWidth = (img.width + 2 * padding - maskSize) / stride + 1;
-        int outHeight = (img.height + 2 * padding - maskSize) / stride + 1;
+        int outWidth = (img.width - maskSize) / stride + 1;
+        int outHeight = (img.height - maskSize) / stride + 1;
         
-        // Print dimensions for debugging
-        printf("Input: %dx%d, Output with stride %d: %dx%d\n", 
-               img.width, img.height, stride, outWidth, outHeight);
-
         // Create single-channel output image structure
         RGBImage outImg;
         outImg.width = outWidth;
@@ -404,19 +400,23 @@ void processBatch(const std::vector<std::string> &inputFiles,
     // Copy mask to constant memory
     cudaMemcpyToSymbol(c_mask, h_mask, maskSize * maskSize * sizeof(float));
 
-    // Calculate output dimensions based on stride
-    int outWidth = (inputImages[0].width + 2 * padding - maskSize) / stride + 1;
-    int outHeight = (inputImages[0].height + 2 * padding - maskSize) / stride + 1;
 
     // Define kernel launch parameters
-    dim3 blockSize(16, 16, 1);
+    dim3 blockSize(16, 16, 1);     //int blockSize = outputTileSize + maskLength - 1;
+    // Calculate output dimensions that match input dimensions with padding
+    int outputTileSizeWidth = (blockSize.x - maskSize) / stride + 1;
+    int outputTileSizeHeight = (blockSize.y - maskSize) / stride + 1;
+
     dim3 gridSize(
-        (outWidth + blockSize.x - 1) / blockSize.x,
-        (outHeight + blockSize.y - 1) / blockSize.y,
+        (inputImages[0].width+ outputTileSizeWidth - 1) / outputTileSizeWidth,
+        (inputImages[0].height+ outputTileSizeHeight - 1) / outputTileSizeHeight,
         batchSize);
+    
+    // Calculate shared memory size
+    int sharedMemSize =  (blockSize.x * stride + maskSize - 1) * (blockSize.y * stride + maskSize - 1) * inputImages[0].channels * sizeof(unsigned char);
 
     // Process all images with a single kernel launch
-    convolution3D_BatchedSingleChannel_InputTiling<<<gridSize, blockSize, (TILE_WIDTH * stride + maskSize - 1) * (TILE_HEIGHT * stride + maskSize - 1) * inputImages[0].channels * sizeof(unsigned char)>>>(
+    convolution3D_BatchedSingleChannel_InputTiling<<<gridSize, blockSize,sharedMemSize>>>(
         d_inputPtrs, d_outputPtrs,
         inputImages[0].width, inputImages[0].height, inputImages[0].channels,
         maskSize, stride, batchSize);
@@ -428,11 +428,12 @@ void processBatch(const std::vector<std::string> &inputFiles,
         fprintf(stderr, "Kernel launch failed: %s\n", cudaGetErrorString(err));
     }
 
+    // i assume all images have the same dimensions as first image 
+    int outWidth = (inputImages[0].width - maskSize) / stride + 1;
+    int outHeight = (inputImages[0].height - maskSize) / stride + 1;
     // Apply normalization to each image
     for (int i = 0; i < batchSize; i++)
     {
-        int outWidth = (inputImages[i].width + 2 * padding - maskSize) / stride + 1;
-        int outHeight = (inputImages[i].height + 2 * padding - maskSize) / stride + 1;
         normalizeImageMinMax(d_outputs[i], outWidth, outHeight);
     }
 

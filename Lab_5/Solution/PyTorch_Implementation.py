@@ -82,7 +82,7 @@ class RGBToGrayscaleConvolution:
         Returns:
             torch.Tensor: Batch of convolved grayscale images [B, 1, H, W]
         """
-      # If stride is 1, we can use the pre-configured conv layer
+        # If stride is 1, we can use the pre-configured conv layer
         if stride == 1:
             with torch.no_grad():
                 output = self.conv(images)
@@ -104,22 +104,26 @@ class RGBToGrayscaleConvolution:
                 # Apply convolution
                 output = temp_conv(images)
                 print(f"Input shape: {images.shape}, Output shape: {output.shape}")
-
+    
         # Print a sample of raw output values
         print(f"\nRaw convolution output (sample):")
         print(output[0, 0, 10:15, 10:15])  # Print a 5x5 patch from first image
         print(f"Raw output min: {torch.min(output).item()}, max: {torch.max(output).item()}")
         
+        # 1. Find maximum absolute value per image (for proper edge detection normalization)
         max_values = torch.amax(torch.abs(output), dim=(1, 2, 3), keepdim=True)
-        normalized = output / (3.0)
-        normalized = torch.where(normalized < 0, torch.zeros_like(normalized), normalized)
-        # Normalize by the max value (avoid division by zero)
-        max_values = torch.clamp(max_values, min=1e-8)  # Avoid division by zero
+        
+        # 2. Avoid division by zero
+        max_values = torch.clamp(max_values, min=1e-8)
+        
+        # 3. Normalize by the max value
         normalized = output / max_values
         
-
+        # 4. Clamp negative values to zero (important for edge detection)
+        normalized = torch.clamp(normalized, min=0.0)
+    
         return normalized
-
+    
     def process_images(self, input_folder, output_folder, batch_size=1, stride=1):
         """
         Process all images in the input folder and save results to the output folder.
@@ -150,8 +154,7 @@ class RGBToGrayscaleConvolution:
         
         # Process images in batches
         total_images = len(image_files)
-        start_time = time.time()
-        
+        total_conv_time = 0.0  # Track convolution time separately
         for i in range(0, total_images, batch_size):
             batch_files = image_files[i:i+batch_size]
             batch_images = []
@@ -178,8 +181,12 @@ class RGBToGrayscaleConvolution:
             print(f"Processing batch {i//batch_size + 1}/{(total_images+batch_size-1)//batch_size} " + 
                  f"({len(batch_images)} images)")
             
+            conv_start = time.time()
             output_tensor = self.apply_convolution(batch_tensor, stride)
-            
+            torch.cuda.synchronize()  # Make sure GPU operations complete before timing
+            conv_end = time.time()
+            batch_conv_time = conv_end - conv_start
+            total_conv_time += batch_conv_time
             # Save output images
             for j, img_file in enumerate(batch_files[:len(batch_images)]):
                 # Get grayscale output and convert to numpy
@@ -192,13 +199,9 @@ class RGBToGrayscaleConvolution:
                 output_path = os.path.join(output_folder, img_file)
                 Image.fromarray(output_img, mode='L').save(output_path)
                 
-        end_time = time.time()
-        total_time = end_time - start_time
+            print(f"Total convolution time: {total_conv_time:.4f} seconds ")
         
-        print(f"Processed {total_images} images in {total_time:.4f} seconds " +
-              f"({total_images/total_time:.2f} images/second)")
-        
-        return total_time
+        return total_conv_time
 
 
 def main():

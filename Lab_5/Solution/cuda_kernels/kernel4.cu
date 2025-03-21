@@ -365,8 +365,8 @@ void processBatch(const std::vector<std::string> &inputFiles,
     cudaMemcpyToSymbol(c_mask, h_mask, maskSize * maskSize * sizeof(float));
 
     // Calculate output dimensions based on stride
-    int outWidth = (inputImages[0].width - maskSize) / stride + 1;
-    int outHeight = (inputImages[0].height - maskSize) / stride + 1;
+    // int outWidth = (inputImages[0].width - maskSize) / stride + 1;
+    // int outHeight = (inputImages[0].height - maskSize) / stride + 1;
 
     // Find maximum dimensions to size grid properly
     int maxOutHeight = *std::max_element(outputHeights.begin(), outputHeights.end());

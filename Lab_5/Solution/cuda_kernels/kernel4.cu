@@ -26,22 +26,31 @@ typedef struct
 
 // New kernel that processes multiple images at once
 __global__ void convolution3D_BatchedSingleChannel(
-    unsigned char **inputs,  // Array of pointers to input images
-    float **outputs,  // Array of pointers to output images
-    int width,               // Assuming all images have same dimensions
-    int height,
+    unsigned char **inputs, // Array of pointers to input images
+    float **outputs,        // Array of pointers to output images
+    int * d_inputWidths,              // Assuming all images have same dimensions
+    int * d_inputHeights,
     int channels,
     int maskSize,
     int stride,
     int batchSize) // Number of images in the batch
 {
-    // Calculate 2D position within the image
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    // Calculate strided 2D position within the output image
+    int out_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int out_y = blockIdx.y * blockDim.y + threadIdx.y;
     int imageIdx = blockIdx.z; // Each z-block handles one image in the batch
 
-    // Skip if we're outside the image bounds or batch size
-    if (x >= width || y >= height || imageIdx >= batchSize)
+    // Calculate input image position by multiplying by stride
+    int in_x = out_x * stride;
+    int in_y = out_y * stride;
+    int width = d_inputWidths[imageIdx];
+    int height = d_inputHeights[imageIdx];
+    // Calculate output dimensions based on stride
+    int  outWidth = (width - maskSize) / stride + 1;
+    int outHeight = (height - maskSize) / stride + 1;
+
+    // Skip if we're outside the output image bounds or batch size
+    if (out_x >=  outWidth || out_y >= outHeight || imageIdx >= batchSize)
         return;
 
     int maskRadius = maskSize / 2;
@@ -50,7 +59,7 @@ __global__ void convolution3D_BatchedSingleChannel(
     // Get pointers for this specific image
     unsigned char *input = inputs[imageIdx];
     float *output = outputs[imageIdx];
-    
+
     // Process each channel (R, G, B) and combine into a single output value
     for (int c = 0; c < channels; c++)
     {
@@ -60,8 +69,8 @@ __global__ void convolution3D_BatchedSingleChannel(
             for (int kx = 0; kx < maskSize; kx++)
             {
                 // Calculate input image coordinates with padding handling
-                int ix = x + kx - maskRadius;
-                int iy = y + ky - maskRadius;
+                int ix = in_x + kx - maskRadius;
+                int iy = in_y + ky - maskRadius;
 
                 // Skip positions outside the image - zero padding
                 if (ix >= 0 && ix < width && iy >= 0 && iy < height)
@@ -79,10 +88,8 @@ __global__ void convolution3D_BatchedSingleChannel(
         }
     }
 
-        // Clamp results to valid range [0, 255]
-       // aggregateValue = fminf(fmaxf(aggregateValue, 0.0f), 255.0f);
     // Write the single-channel result to the output image
-    output[y * width + x] = aggregateValue;
+    output[out_y * outWidth + out_x] = aggregateValue;
 }
 
 // Kernel to find minimum and maximum values in the output image
@@ -135,19 +142,19 @@ __global__ void normalizeImage(
     // float pixelValue = static_cast<float>(image[idx]);
 
     // // Avoid division by zero
-    // float range = maxValue - 0.001f; 
+    // float range = maxValue - 0.001f;
 
     // Normalize to [0, 255] range with strict clamping
     // Handle positive and negative values differently
     float pixelValue = image[idx];
-    if (pixelValue < 0.0f) {
+    if (pixelValue < 0.0f)
+    {
         // For negative values, clamp to 0
         pixelValue = 0.0f;
-    } 
-      
-    image[idx]= ((pixelValue) / maxValue) * 255.0f; ;
+    }
 
-
+    image[idx] = ((pixelValue) / maxValue) * 255.0f;
+    ;
 
     // // Ensure strict adherence to 0-255 range
     // if (normalized < 0.0f)
@@ -156,7 +163,6 @@ __global__ void normalizeImage(
     //     normalized = 255.0f;
 
     // image[idx] = static_cast<unsigned char>(normalized);
-
 }
 
 // Function to perform min/max normalization on a single-channel image
@@ -194,7 +200,7 @@ void normalizeImageMinMax(float *d_image, int width, int height)
         globalMax = fmaxf(globalMax, h_maxValues[i]);
     }
 
-    printf("Image min: %f, max: %f\n", globalMin, globalMax);
+    // printf("Image min: %f, max: %f\n", globalMin, globalMax);
 
     // Now normalize the image based on min/max
     normalizeImage<<<blocksPerGrid, threadsPerBlock>>>(d_image, size, globalMin, globalMax);
@@ -235,54 +241,25 @@ void readMaskFile(const char *filename, float **mask, int *size)
 RGBImage loadImage(const char *filename)
 {
     RGBImage image;
-
-    // printf("Loading image: %s\n", filename);
-
-    // Load original image using stb_image
-    int originalWidth, originalHeight, originalChannels;
-    unsigned char *originalData = stbi_load(filename, &originalWidth, &originalHeight, &originalChannels, 3);
-
-    if (!originalData)
+    int width, height, channels;
+    
+    // Load image with stb_image
+    unsigned char *data = stbi_load(filename, &width, &height, &channels, 3);
+    
+    if (!data)
     {
         fprintf(stderr, "Failed to load image '%s': %s\n", filename, stbi_failure_reason());
         exit(EXIT_FAILURE);
     }
-
-   // printf("Loaded %s (%dx%d with %d channels)\n", filename, originalWidth, originalHeight, originalChannels);
-
-    // Set target dimensions for all images
-    const int targetWidth = 512;
-    const int targetHeight = 512;
-
-    // Allocate memory for the resized image
-    image.width = targetWidth;
-    image.height = targetHeight;
-    image.channels = originalChannels;
-    image.data = (unsigned char *)malloc(targetWidth * targetHeight * originalChannels);
-
-    // Simple resize using nearest neighbor interpolation
-    for (int y = 0; y < targetHeight; y++)
-    {
-        for (int x = 0; x < targetWidth; x++)
-        {
-            // Map target coordinates to source coordinates
-            int srcX = (x * originalWidth) / targetWidth;
-            int srcY = (y * originalHeight) / targetHeight;
-
-            // Copy each channel
-            for (int c = 0; c < originalChannels; c++)
-            {
-                image.data[(y * targetWidth + x) * originalChannels + c] =
-                    originalData[(srcY * originalWidth + srcX) * originalChannels + c];
-            }
-        }
-    }
-
-    // Free the original image data
-    stbi_image_free(originalData);
-
-    // printf("Resized to %dx%d\n", image.width, image.height);
-
+    
+    // Set image properties
+    image.width = width;
+    image.height = height;
+    image.channels = 3; // Force 3 channels (RGB)
+    image.data = data;  // Use the buffer directly instead of copying
+    
+    printf("Loaded %s (%dx%d with %d channels)\n", filename, width, height, channels);
+    
     return image;
 }
 
@@ -291,12 +268,12 @@ void saveImage(const char *filename, RGBImage image)
 {
     // Make sure we're using exactly 1 channel
     const int channels = 1;
-    
+
     // Calculate stride (bytes per row)
     const int stride = image.width * channels;
-    
+
     // Save as PNG (which handles grayscale well)
-    int success = stbi_write_png(filename, image.width, image.height, channels, 
+    int success = stbi_write_png(filename, image.width, image.height, channels,
                                  image.data, stride);
 
     if (!success)
@@ -304,6 +281,7 @@ void saveImage(const char *filename, RGBImage image)
         fprintf(stderr, "Failed to save image '%s'\n", filename);
     }
 }
+
 // Process a batch of images
 void processBatch(const std::vector<std::string> &inputFiles,
                   const std::string &outputFolder,
@@ -323,59 +301,89 @@ void processBatch(const std::vector<std::string> &inputFiles,
     std::vector<RGBImage> inputImages;
     std::vector<RGBImage> outputImages;
     std::vector<unsigned char *> d_inputs;
-    std::vector<float *> d_outputs; 
-
+    std::vector<float *> d_outputs;
+    // Arrays to store dimensions for each image
+    std::vector<int> inputWidths;
+    std::vector<int> inputHeights;
+    std::vector<int> outputWidths;
+    std::vector<int> outputHeights;
+    // Load all images and store thier dimensions so that i can use different dimensions for each image
     for (const auto &inputFile : inputFiles)
     {
         RGBImage img = loadImage(inputFile.c_str());
         inputImages.push_back(img);
 
+        // Store the dimensions
+        inputWidths.push_back(img.width);
+        inputHeights.push_back(img.height);
+
+        // Calculate output dimensions based on stride
+        int outWidth = (img.width - maskSize) / stride + 1;
+        int outHeight = (img.height - maskSize) / stride + 1;
+        outputWidths.push_back(outWidth);
+        outputHeights.push_back(outHeight);
         // Create single-channel output image structure
         RGBImage outImg;
-        outImg.width = img.width;
-        outImg.height = img.height;
+        outImg.width = outWidth;
+        outImg.height = outHeight;
         outImg.channels = 1; // Grayscale output
-        outImg.data = (unsigned char *)malloc(img.width * img.height * sizeof(unsigned char));
+        outImg.data = (unsigned char *)malloc(outWidth * outHeight * sizeof(unsigned char));
         outputImages.push_back(outImg);
 
         // Allocate device memory
         unsigned char *d_input;
-        float *d_output; 
+        float *d_output;
         cudaMalloc(&d_input, img.width * img.height * img.channels * sizeof(unsigned char));
-        cudaMalloc(&d_output, img.width * img.height * sizeof(float));
+        cudaMalloc(&d_output, outWidth * outHeight * sizeof(float));
 
         // Copy image data to device
         cudaMemcpy(d_input, img.data, img.width * img.height * img.channels * sizeof(unsigned char), cudaMemcpyHostToDevice);
-
+        
         d_inputs.push_back(d_input);
         d_outputs.push_back(d_output);
     }
+    // Allocate device memory for dimension arrays
+    int *d_inputWidths, *d_inputHeights;
+    cudaMalloc(&d_inputWidths, batchSize * sizeof(int));
+    cudaMalloc(&d_inputHeights, batchSize * sizeof(int));
+    // Copy dimension data to the device
+    cudaMemcpy(d_inputHeights, inputHeights.data(), batchSize * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_inputWidths, inputWidths.data(), batchSize * sizeof(int), cudaMemcpyHostToDevice);
+   
 
     // Create device arrays to hold pointers to all images
     unsigned char **d_inputPtrs;
-    float **d_outputPtrs;  // Changed to float**
+    float **d_outputPtrs; // Changed to float**
     cudaMalloc(&d_inputPtrs, batchSize * sizeof(unsigned char *));
-    cudaMalloc(&d_outputPtrs, batchSize * sizeof(float *));  // Changed to float*
+    cudaMalloc(&d_outputPtrs, batchSize * sizeof(float *)); // Changed to float*
 
     // Copy the arrays of pointers to the device
     cudaMemcpy(d_inputPtrs, d_inputs.data(), batchSize * sizeof(unsigned char *), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_outputPtrs, d_outputs.data(), batchSize * sizeof(float *), cudaMemcpyHostToDevice);  // Changed to float*
+    cudaMemcpy(d_outputPtrs, d_outputs.data(), batchSize * sizeof(float *), cudaMemcpyHostToDevice); // Changed to float*
 
     // Copy mask to constant memory
     cudaMemcpyToSymbol(c_mask, h_mask, maskSize * maskSize * sizeof(float));
 
+    // Calculate output dimensions based on stride
+    int outWidth = (inputImages[0].width - maskSize) / stride + 1;
+    int outHeight = (inputImages[0].height - maskSize) / stride + 1;
+
+    // Find maximum dimensions to size grid properly
+    int maxOutHeight = *std::max_element(outputHeights.begin(), outputHeights.end());
+    int maxOutWidth = *std::max_element(outputWidths.begin(), outputWidths.end());
+    
     // Define kernel launch parameters
     dim3 blockSize(16, 16, 1);
     dim3 gridSize(
-        (inputImages[0].width + blockSize.x - 1) / blockSize.x,
-        (inputImages[0].height + blockSize.y - 1) / blockSize.y,
-        batchSize // One z-block per image
-    );
+        (maxOutWidth + blockSize.x - 1) / blockSize.x,
+        (maxOutHeight + blockSize.y - 1) / blockSize.y,
+        batchSize);
 
     // Process all images with a single kernel launch
     convolution3D_BatchedSingleChannel<<<gridSize, blockSize>>>(
         d_inputPtrs, d_outputPtrs,
-        inputImages[0].width, inputImages[0].height, inputImages[0].channels,
+        d_inputWidths, d_inputHeights, inputImages[0].channels,
+         
         maskSize, stride, batchSize);
 
     // Check for errors
@@ -388,62 +396,62 @@ void processBatch(const std::vector<std::string> &inputFiles,
     // Apply normalization to each image
     for (int i = 0; i < batchSize; i++)
     {
-        normalizeImageMinMax(d_outputs[i], inputImages[i].width, inputImages[i].height);
+        // int outWidth = (inputImages[i].width - maskSize) / stride + 1;
+        // int outHeight = (inputImages[i].height - maskSize) / stride + 1;
+        normalizeImageMinMax(d_outputs[i],outputWidths[i], outputHeights[i]);
     }
 
-   // Copy results back to host and save output images
-   for (int i = 0; i < batchSize; i++)
-   {
-       // Get output filename
-       std::string inputFile = inputFiles[i];
-       size_t lastSlash = inputFile.find_last_of("/\\");
-       std::string baseName = inputFile.substr(lastSlash + 1);
-       std::string outputFile = outputFolder + "/" + baseName;
-       
-       // Allocate host memory for float results
-       float* h_floatOutput = (float*)malloc(inputImages[i].width * inputImages[i].height * sizeof(float));
-       
-       // Copy processed image back to host (as float)
-       cudaMemcpy(h_floatOutput, d_outputs[i],
-                 inputImages[i].width * inputImages[i].height * sizeof(float),
-                 cudaMemcpyDeviceToHost);
-       
-    //    // Print some statistics about the float values
-    //    float minVal = h_floatOutput[0], maxVal = h_floatOutput[0];
-    //    for (int j = 1; j < inputImages[i].width * inputImages[i].height; j++) {
-    //        if (h_floatOutput[j] < minVal) minVal = h_floatOutput[j];
-    //        if (h_floatOutput[j] > maxVal) maxVal = h_floatOutput[j];
-    //    }
-    //    printf("Image %d min value: %.2f, max value: %.2f\n", i, minVal, maxVal);
-       
-    //    // Convert float to unsigned char for saving
-    //    for (int j = 0; j < inputImages[i].width * inputImages[i].height; j++) {
-    //        // Normalize to 0-255 range
-    //        float normalized = 255.0f * (h_floatOutput[j] - minVal) / (maxVal - minVal);
-    //        outputImages[i].data[j] = static_cast<unsigned char>(fminf(fmaxf(normalized, 0.0f), 255.0f));
-    //    }
+    // Copy results back to host and save output images
+    for (int i = 0; i < batchSize; i++)
+    {
+        // Get output filename
+        std::string inputFile = inputFiles[i];
+        size_t lastSlash = inputFile.find_last_of("/\\");
+        std::string baseName = inputFile.substr(lastSlash + 1);
+        std::string outputFile = outputFolder + "/" + baseName;
 
-      // Convert float values to unsigned char for output image
-      for (int j = 0; j < inputImages[i].width * inputImages[i].height; j++) {
-        // The normalizeImage kernel should have already scaled values to 0-255 range
-        float value = h_floatOutput[j];
-        // Convert to unsigned char
-        outputImages[i].data[j] = static_cast<unsigned char>(value);
+        float *h_floatOutput = (float *)malloc(outputWidths[i] * outputHeights[i] * sizeof(float));
+        cudaMemcpy(h_floatOutput, d_outputs[i],
+            outputWidths[i] * outputHeights[i]* sizeof(float),
+                   cudaMemcpyDeviceToHost);
+
+        //    // Print some statistics about the float values
+        //    float minVal = h_floatOutput[0], maxVal = h_floatOutput[0];
+        //    for (int j = 1; j < inputImages[i].width * inputImages[i].height; j++) {
+        //        if (h_floatOutput[j] < minVal) minVal = h_floatOutput[j];
+        //        if (h_floatOutput[j] > maxVal) maxVal = h_floatOutput[j];
+        //    }
+        //    printf("Image %d min value: %.2f, max value: %.2f\n", i, minVal, maxVal);
+
+        //    // Convert float to unsigned char for saving
+        //    for (int j = 0; j < inputImages[i].width * inputImages[i].height; j++) {
+        //        // Normalize to 0-255 range
+        //        float normalized = 255.0f * (h_floatOutput[j] - minVal) / (maxVal - minVal);
+        //        outputImages[i].data[j] = static_cast<unsigned char>(fminf(fmaxf(normalized, 0.0f), 255.0f));
+        //    }
+
+        // Convert float values to unsigned char for output image
+        for (int j = 0; j <  outputWidths[i] *  outputHeights[i]; j++)
+        {
+            float value = h_floatOutput[j];
+            outputImages[i].data[j] = static_cast<unsigned char>(value);
+        }
+        // Save processed image (single channel grayscale)
+        saveImage(outputFile.c_str(), outputImages[i]);
+
+        // Free device and host memory
+        cudaFree(d_inputs[i]);
+        cudaFree(d_outputs[i]);
+        free(h_floatOutput);
+        free(inputImages[i].data);
+        free(outputImages[i].data);
     }
-       // Save processed image (single channel grayscale)
-       saveImage(outputFile.c_str(), outputImages[i]);
 
-       // Free device and host memory
-       cudaFree(d_inputs[i]);
-       cudaFree(d_outputs[i]);
-       free(h_floatOutput);
-       free(inputImages[i].data);
-       free(outputImages[i].data);
-   }
-   
-   // Free device pointer arrays
-   cudaFree(d_inputPtrs);
-   cudaFree(d_outputPtrs);
+    // Free device pointer arrays
+    cudaFree(d_inputPtrs);
+    cudaFree(d_outputPtrs);
+    cudaFree(d_inputWidths);
+    cudaFree(d_inputHeights);
 }
 
 // List all image files in a directory
@@ -516,7 +524,7 @@ std::vector<std::string> listImageFiles(const std::string &folderPath)
                 // Add full path to the list
                 std::string fullPath = folderPath + "\\" + filename;
                 files.push_back(fullPath);
-               // printf("Found image file: %s\n", fullPath.c_str());
+                // printf("Found image file: %s\n", fullPath.c_str());
             }
         }
 

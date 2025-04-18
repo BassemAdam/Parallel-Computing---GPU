@@ -382,9 +382,9 @@ void processBatch(const std::vector<std::string> &inputFiles,
     // Copy mask to constant memory
     cudaMemcpyToSymbol(c_mask, h_mask, maskSize * maskSize * sizeof(float));
 
-        // Find maximum dimensions to size grid properly
-        int maxOutHeight = *std::max_element(outputHeights.begin(), outputHeights.end());
-        int maxOutWidth = *std::max_element(outputWidths.begin(), outputWidths.end());
+    // Find maximum dimensions to size grid properly
+    int maxOutHeight = *std::max_element(outputHeights.begin(), outputHeights.end());
+    int maxOutWidth = *std::max_element(outputWidths.begin(), outputWidths.end());
     // Define kernel launch parameters
     dim3 blockSize(16, 16, 1);     //int blockSize = outputTileSize + maskLength - 1;
     // Calculate output dimensions that match input dimensions with padding

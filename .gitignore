@@ -75,8 +75,11 @@ Lab_5/Solution/Output_TestCases
 Lab_5/Solution/analytics_Bin
 Reduction_Sync_Warps_1/Solution/analytics_Bin
 Reduction_Sync_Warps_1/Solution/cuda_kernels/bin
-Reduction_Sync_Warps_1/Solution/
-Reduction_Sync_Warps_1/Solution/
+
+
 Lab_2/kernel.lib
 Lab_2/kernel3.cu
 Lab_2/
+Des/cuda_kernels/bin
+/Reduction_Sync_Warps_1/Solution/Output_TestCases
+/Reduction_Sync_Warps_1/Solution/Output_TestCases

@@ -1,8 +1,7 @@
 /* des_cuda.cu
  * CUDA implementation of DES encryption/decryption in ECB mode.
  * One thread handles one 64-bit block.
- */
-
+*/
 #include <stdio.h>
 #include <stdint.h>
 #include <cuda.h>
@@ -116,8 +115,7 @@ __device__ __constant__ uint8_t SHIFTS[16] = {1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2
 __device__ __constant__ uint64_t d_subkeys[16];
 
 // Helper: apply permutation
-__device__ uint64_t permute(uint64_t in, const uint8_t *table, int n)
-{
+__device__ uint64_t permute(uint64_t in, const uint8_t *table, int n){
     uint64_t out = 0;
     for (int i = 0; i < n; i++)
     {
@@ -128,8 +126,7 @@ __device__ uint64_t permute(uint64_t in, const uint8_t *table, int n)
 }
 
 // Feistel function
-__device__ uint32_t feistel(uint32_t R, uint64_t subkey)
-{
+__device__ uint32_t feistel(uint32_t R, uint64_t subkey){
     // Expansion
     uint64_t eR = permute((uint64_t)R << 32, E, 48);
     // Key mixing
@@ -149,10 +146,7 @@ __device__ uint32_t feistel(uint32_t R, uint64_t subkey)
 }
 
 // DES kernel: one thread per 64-bit block
-__global__ void des_encrypt_kernel(const uint64_t *d_in,
-                                   uint64_t *d_out,
-                                   size_t num_blocks)
-{
+__global__ void des_encrypt_kernel(const uint64_t *d_in,uint64_t *d_out,size_t num_blocks){
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_blocks)
         return;
@@ -176,8 +170,7 @@ __global__ void des_encrypt_kernel(const uint64_t *d_in,
 }
 
 // Helper: Convert host permutation function for key generation
-uint64_t host_permute(uint64_t in, const uint8_t *table, int n)
-{
+uint64_t host_permute(uint64_t in, const uint8_t *table, int n){
     uint64_t out = 0;
     for (int i = 0; i < n; i++)
     {
@@ -207,8 +200,7 @@ uint8_t h_PC2[48] = {
 uint8_t h_SHIFTS[16] = {1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1};
 
 // Host: generate subkeys and copy to device constant memory
-void generate_subkeys(uint64_t key, uint64_t *subkeys, bool decrypt)
-{
+void generate_subkeys(uint64_t key, uint64_t *subkeys, bool decrypt){
     // PC-1 permutation
     uint64_t perm = host_permute(key, h_PC1, 56);
     uint32_t C = (perm >> 28) & 0x0FFFFFFF;
@@ -240,8 +232,7 @@ void generate_subkeys(uint64_t key, uint64_t *subkeys, bool decrypt)
     }
 }
 
-int main(int argc, char *argv[])
-{
+int main(int argc, char *argv[]){
     // Check command line arguments
     if (argc != 4)
     {
@@ -373,7 +364,6 @@ int main(int argc, char *argv[])
 
     // Device buffers
     uint64_t *d_in, *d_out;
-    cudaError_t err;
 
     cudaMalloc(&d_in, num_blocks * sizeof(uint64_t));
 

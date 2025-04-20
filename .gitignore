@@ -85,3 +85,8 @@ Des/cuda_kernels/bin
 /Reduction_Sync_Warps_1/Solution/Output_TestCases
 Des/code/bin
 Des/analytics_Bin
+Lab_6_PrefixSum/analytics_Bin
+Lab_6_PrefixSum/Generator_TestCases
+Lab_6_PrefixSum/cuda_kernels/bin
+Lab_6_PrefixSum/Input_TestCases
+Lab_6_PrefixSum/Output_TestCases

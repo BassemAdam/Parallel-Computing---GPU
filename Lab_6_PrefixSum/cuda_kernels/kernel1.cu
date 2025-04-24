@@ -8,72 +8,70 @@
 __device__ int blockCounter;
 // Global flags
 __device__ unsigned int *flags;
-__device__ const  int BLOCK_SIZE=256;
+__device__ const int BLOCK_SIZE = 256;
 __global__ void EfficientPrefixSumUlt(float *input, float *output, int length)
 {
-
-    // Normal Prefix Sum
-    __shared__ float s_accSum[2*BLOCK_SIZE];
-    // Checking that Blocks are executed in order
+    // Shared memory for scan operation
+    __shared__ float s_data[BLOCK_SIZE];
+    
+    // Block ID tracking
     __shared__ int s_blk_id;
- 
-    if (threadIdx.x == 0) s_blk_id = atomicAdd(&blockCounter, 1);
+    if (threadIdx.x == 0)
+        s_blk_id = atomicAdd(&blockCounter, 1);
     __syncthreads();
-
+    
+    // Load input into shared memory
     int idx = threadIdx.x + blockDim.x * s_blk_id;
-    s_accSum[threadIdx.x] = idx < length ? input[idx] : 0;     // why not return ? and must be zero ?
-
-
-    if (idx >= length) return;
-
-    // wa e7na nazlien lmien
-    for (size_t stride = 1; stride < BLOCK_SIZE; stride *= 2)
-    {
-        int index = threadIdx.x*stride*2 + stride*2 - 1;
-        if (index <=BLOCK_SIZE*2)
-        {
-            s_accSum[index] += s_accSum[index- stride];
+    s_data[threadIdx.x] = idx < length ? input[idx] : 0;
+    __syncthreads();
+    
+    if (idx >= length)
+        return;
+        
+    // Up-sweep (Reduction) phase
+    for (unsigned int stride = 1; stride < blockDim.x; stride *= 2) {
+        int index = (threadIdx.x + 1) * 2 * stride - 1;
+        if (index < blockDim.x) {
+            s_data[index] += s_data[index - stride];
         }
         __syncthreads();
     }
-
-    // wa e7na nazlien 
-    for (size_t stride = BLOCK_SIZE/2; stride > 0; stride /= 2)
-    {
-        __syncthreads();
-        int index = threadIdx.x*stride*2 + stride*2 - 1;
-        if (index+ stride<=BLOCK_SIZE*2)
-        {
-            s_accSum[index + stride] += s_accSum[index];
-        }
+    
+    // Clear the last element
+    if (threadIdx.x == 0) {
+        s_data[blockDim.x - 1] = 0;
     }
     __syncthreads();
     
-    // Checking that Blocks are executed in order
-    __shared__ float s_previous_sum;
-    if (threadIdx.x == 0)
-    {
-        // wait for previous flag that the block before it is finished
-        while (s_blk_id != 0 && atomicAdd(&flags[s_blk_id - 1], 0) == 0)
-        {
+    // Down-sweep (Distribution) phase
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        int index = (threadIdx.x + 1) * 2 * stride - 1;
+        if (index < blockDim.x) {
+            float temp = s_data[index];
+            s_data[index] += s_data[index - stride];
+            s_data[index - stride] = temp;
         }
-
+        __syncthreads();
+    }
+    
+    // Handle cross-block dependencies
+    __shared__ float s_previous_sum;
+    if (threadIdx.x == 0) {
+        // Wait for previous block to complete
+        while (s_blk_id != 0 && atomicAdd(&flags[s_blk_id - 1], 0) == 0) {}
+        
         s_previous_sum = s_blk_id > 0 ? output[idx - 1] : 0;
     }
     __syncthreads();
-
+    
+    // Convert to inclusive sum by adding the original value
     if (idx < length)
-        output[idx] = s_accSum[threadIdx.x] + s_previous_sum;
-
-
-    // set flag
-    if (threadIdx.x == blockDim.x - 1)
-    {
-        // wait for all cached values to be moving to global memory
+        output[idx] =  s_data[threadIdx.x] + s_previous_sum + input[idx];
+    
+    // Signal completion
+    if (threadIdx.x == blockDim.x - 1) {
         __threadfence();
-
-        // set flag
-        atomicAdd(&flags[s_blk_id], 1); // Changed from flags[s_blk_id + 1]
+        atomicAdd(&flags[s_blk_id], 1);
     }
 }
 
@@ -121,7 +119,8 @@ void writeOutputFile(const char *filename, float *data, int length)
     fclose(file);
 }
 
-int main(int argc, char *argv[]){
+int main(int argc, char *argv[])
+{
     if (argc != 3)
     {
         printf("ERROR Usage: %s <inputfile> <outputfile>\n", argv[0]);
@@ -160,8 +159,10 @@ int main(int argc, char *argv[]){
     // Copy pointer to device symbol
     cudaMemcpyToSymbol(flags, &d_flags, sizeof(unsigned int *));
 
+    size_t sharedMemSize = inputLength > 256 ? blockSize * sizeof(float) : inputLength * sizeof(float);
+
     // Launch convolution kernel with output tiling
-    EfficientPrefixSumUlt<<<gridSize, blockSize>>>(d_input, d_output, inputLength);
+    EfficientPrefixSumUlt<<<gridSize, blockSize,sharedMemSize>>>(d_input, d_output, inputLength);
 
     // Copy result back to host
     float *h_output = (float *)malloc(inputLength * sizeof(float));

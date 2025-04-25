@@ -1,4 +1,4 @@
-/* Work Inefficient PrefixSum*/
+/* Thread Coarsened PrefixSum */
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
@@ -9,8 +9,10 @@ __device__ int blockCounter;
 // Global flags
 __device__ unsigned int *flags;
 __device__ const int BLOCK_SIZE = 256;
+// Thread coarsening factor - each thread processes this many elements
+#define COARSENING_FACTOR 4
 
-__global__ void EfficientPrefixSumUlt(float *input, float *output, int length)
+__global__ void CoarsenedPrefixSumUlt(float *input, float *output, int length)
 {
     // Shared memory for scan operation
     __shared__ float s_data[BLOCK_SIZE];
@@ -21,15 +23,28 @@ __global__ void EfficientPrefixSumUlt(float *input, float *output, int length)
         s_blk_id = atomicAdd(&blockCounter, 1);
     __syncthreads();
     
-    // Load input into shared memory
-    int idx = threadIdx.x + blockDim.x * s_blk_id;
-    float original_value = idx < length ? input[idx] : 0;
-    s_data[threadIdx.x] = original_value;
+    // Each thread now handles COARSENING_FACTOR elements
+    int base_idx = (threadIdx.x + blockDim.x * s_blk_id) * COARSENING_FACTOR;
+    
+    // Step 1: Each thread computes local sum of its COARSENING_FACTOR elements
+    float thread_sum = 0;
+    float local_vals[COARSENING_FACTOR];
+    
+    // Load and sum the coarsened elements
+    for (int i = 0; i < COARSENING_FACTOR; i++) {
+        int global_idx = base_idx + i;
+        if (global_idx < length) {
+            local_vals[i] = input[global_idx];
+            thread_sum += local_vals[i];
+        } else {
+            local_vals[i] = 0;
+        }
+    }
+    
+    // Load local sum into shared memory for block scan
+    s_data[threadIdx.x] = thread_sum;
     __syncthreads();
     
-    if (idx >= length)
-        return;
-        
     // Up-sweep (Reduction) phase
     for (unsigned int stride = 1; stride < blockDim.x; stride *= 2) {
         int index = (threadIdx.x + 1) * 2 * stride - 1;
@@ -39,10 +54,10 @@ __global__ void EfficientPrefixSumUlt(float *input, float *output, int length)
         __syncthreads();
     }
     
-    // Clear the last element for exclusive scan within block
-    if (threadIdx.x == 0) s_data[blockDim.x - 1] = 0;
-     
-    
+    //setting the last element to 0
+    if (threadIdx.x == 0) {
+        s_data[blockDim.x - 1] = 0;
+    }
     __syncthreads();
     
     // Down-sweep (Distribution) phase - exclusive scan
@@ -56,21 +71,38 @@ __global__ void EfficientPrefixSumUlt(float *input, float *output, int length)
         __syncthreads();
     }
     
+    // Get the exclusive prefix for this thread from the block scan
+    float thread_prefix = s_data[threadIdx.x];
+    
     // Handle cross-block dependencies
     __shared__ float s_previous_sum;
     if (threadIdx.x == 0) {
         // Wait for previous block to complete
         while (s_blk_id != 0 && atomicAdd(&flags[s_blk_id - 1], 0) == 0) {}
         
-        s_previous_sum = s_blk_id > 0 ? output[blockDim.x * s_blk_id - 1] : 0;
+        s_previous_sum = s_blk_id > 0 ? output[(s_blk_id * blockDim.x * COARSENING_FACTOR) - 1] : 0;
     }
     __syncthreads();
     
-    // Convert from exclusive to inclusive scan
-    if (idx < length)
-        output[idx] = s_data[threadIdx.x] + original_value + s_previous_sum;
+    // Now calculate prefix sum for each element this thread handles
+    float running_sum = thread_prefix + s_previous_sum;
     
-    // Signal completion - use the last computed value for this block
+    // Process first element separately (the prefix excludes this element)
+    if (base_idx < length) {
+        output[base_idx] = running_sum + local_vals[0];
+        running_sum = output[base_idx];
+    }
+    
+    // Process remaining elements (inclusive scan within thread)
+    for (int i = 1; i < COARSENING_FACTOR; i++) {
+        int global_idx = base_idx + i;
+        if (global_idx < length) {
+            running_sum += local_vals[i];
+            output[global_idx] = running_sum;
+        }
+    }
+    
+    // Signal completion - last thread updates the flag
     if (threadIdx.x == blockDim.x - 1) {
         __threadfence();
         atomicAdd(&flags[s_blk_id], 1);
@@ -146,7 +178,9 @@ int main(int argc, char *argv[])
     cudaMemcpy(d_input, h_input, inputLength * sizeof(float), cudaMemcpyHostToDevice);
 
     int blockSize = BLOCK_SIZE;
-    int gridSize = (inputLength + blockSize - 1) / blockSize;
+    // Adjust grid size for coarsening - each thread handles COARSENING_FACTOR elements
+    int gridSize = (inputLength + (blockSize * COARSENING_FACTOR) - 1) / (blockSize * COARSENING_FACTOR);
+    
     // Reset block counter before kernel launch
     int zero = 0;
     cudaMemcpyToSymbol(blockCounter, &zero, sizeof(int));
@@ -161,10 +195,22 @@ int main(int argc, char *argv[])
     // Copy pointer to device symbol
     cudaMemcpyToSymbol(flags, &d_flags, sizeof(unsigned int *));
 
-    size_t sharedMemSize = inputLength > 256 ? blockSize * sizeof(float) : inputLength * sizeof(float);
+    // Shared memory allocation (now just BLOCK_SIZE since we use local array)
+    size_t sharedMemSize = BLOCK_SIZE * sizeof(float);
 
-    // Launch convolution kernel with output tiling
-    EfficientPrefixSumUlt<<<gridSize, blockSize,sharedMemSize>>>(d_input, d_output, inputLength);
+    // Time measurement
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // Launch coarsened prefix sum kernel
+    CoarsenedPrefixSumUlt<<<gridSize, blockSize, sharedMemSize>>>(d_input, d_output, inputLength);
+    
+    // Wait for kernel to finish
+    cudaDeviceSynchronize();
+
+    // End timing
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    printf("Thread coarsened execution time (factor=%d): %lld ms\n", COARSENING_FACTOR, duration);
 
     // Copy result back to host
     float *h_output = (float *)malloc(inputLength * sizeof(float));

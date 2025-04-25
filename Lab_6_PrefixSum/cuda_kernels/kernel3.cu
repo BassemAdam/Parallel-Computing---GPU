@@ -411,10 +411,10 @@ int main(int argc, char *argv[]) {
         //pinned_time += runWithPinnedMemory(h_input, h_output, inputLength);
         
         // Run with unified memory
-        unified_time += runWithUnifiedMemory(h_input, h_output, inputLength);
+        //unified_time += runWithUnifiedMemory(h_input, h_output, inputLength);
         
         // Run with zero-copy memory
-        //zerocopy_time += runWithZeroCopyMemory(h_input, h_output, inputLength);
+        zerocopy_time += runWithZeroCopyMemory(h_input, h_output, inputLength);
     }
     
     // Calculate averages
